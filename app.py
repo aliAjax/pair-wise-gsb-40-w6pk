@@ -15,7 +15,9 @@ from urllib.parse import urlparse
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DB = ROOT / "maritime_sar.db"
 ACTIVE_INCIDENT = {"reported", "coordinating", "recovering"}
-CLOSED_INCIDENT = {"closed", "cancelled", "duplicate"}
+CLOSED_INCIDENT = {"closed", "cancelled", "duplicate", "merged"}
+# 待确认的重复报警仍可能在开展核查，允许建区域、录线索；合并后即冻结
+WORKABLE_INCIDENT = ACTIVE_INCIDENT | {"duplicate"}
 
 
 class DomainError(Exception):
@@ -153,6 +155,18 @@ class MaritimeSARService:
                     merged_at TEXT,
                     summary TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS merge_batches (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    client_batch_id TEXT NOT NULL UNIQUE,
+                    duplicate_id INTEGER NOT NULL REFERENCES incidents(id),
+                    primary_id INTEGER NOT NULL REFERENCES incidents(id),
+                    actor TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    summary TEXT NOT NULL DEFAULT '{}',
+                    revert_reason TEXT NOT NULL DEFAULT '',
+                    confirmed_at TEXT NOT NULL,
+                    reverted_at TEXT
+                );
                 CREATE TABLE IF NOT EXISTS timeline (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     incident_id INTEGER REFERENCES incidents(id),
@@ -163,6 +177,7 @@ class MaritimeSARService:
                 );
                 CREATE INDEX IF NOT EXISTS idx_clues_incident ON clues(incident_id, recorded_at);
                 CREATE INDEX IF NOT EXISTS idx_timeline_incident ON timeline(incident_id, id);
+                CREATE INDEX IF NOT EXISTS idx_merge_batches_duplicate ON merge_batches(duplicate_id);
                 """
             )
 
@@ -276,7 +291,7 @@ class MaritimeSARService:
             incident = conn.execute("SELECT * FROM incidents WHERE id=?", (incident_id,)).fetchone()
             if not incident:
                 raise DomainError("事件不存在", 404)
-            if incident["status"] not in ACTIVE_INCIDENT:
+            if incident["status"] not in WORKABLE_INCIDENT:
                 raise DomainError("当前事件不能创建搜索区域", 409)
             try:
                 cur = conn.execute(
@@ -302,7 +317,7 @@ class MaritimeSARService:
             if area["assigned_asset_id"] is not None:
                 raise DomainError("搜索区域已经分配", 409)
             incident = conn.execute("SELECT * FROM incidents WHERE id=?", (area["incident_id"],)).fetchone()
-            if not incident or incident["status"] not in ACTIVE_INCIDENT:
+            if not incident or incident["status"] not in WORKABLE_INCIDENT:
                 raise DomainError("事件当前不可分配", 409)
             if expected_asset_version is not None and asset["version"] != int(expected_asset_version):
                 raise DomainError("资源状态已变化，请刷新后重试", 409)
@@ -353,7 +368,7 @@ class MaritimeSARService:
             incident = conn.execute("SELECT * FROM incidents WHERE id=?", (incident_id,)).fetchone()
             if not incident:
                 raise DomainError("事件不存在", 404)
-            if incident["status"] in CLOSED_INCIDENT:
+            if incident["status"] not in WORKABLE_INCIDENT:
                 raise DomainError("已结束事件不能新增线索", 409)
             if area_id is not None:
                 area = conn.execute("SELECT * FROM search_areas WHERE id=? AND incident_id=?", (area_id, incident_id)).fetchone()
@@ -479,6 +494,196 @@ class MaritimeSARService:
             self._audit(conn, incident_id, actor, "incident.closed", {"outcome": outcome})
             return dict(conn.execute("SELECT * FROM incidents WHERE id=?", (incident_id,)).fetchone())
 
+    def confirm_duplicate_merge(self, actor: str, role: str, client_batch_id: str,
+                                duplicate_id: int, primary_id: int) -> dict[str, Any]:
+        """确认重复报警：把其搜索区域和线索并入主事件，原报警编号保留可追溯。
+
+        以 client_batch_id 作为同一批次的幂等键；重复报警的状态翻转采用
+        CAS，两名值班员并发确认时只有一方能成功。
+        """
+        actor = clean_actor(actor)
+        require_role(role, {"coordinator"}, "确认重复报警合并")
+        batch_id = client_batch_id.strip()
+        if not batch_id:
+            raise DomainError("缺少合并批次编号")
+        try:
+            duplicate_id, primary_id = int(duplicate_id), int(primary_id)
+        except (TypeError, ValueError) as exc:
+            raise DomainError("事件编号必须是整数") from exc
+        if duplicate_id == primary_id:
+            raise DomainError("重复报警与主事件不能是同一条事件")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute("SELECT * FROM merge_batches WHERE client_batch_id=?", (batch_id,)).fetchone()
+            if existing:
+                if int(existing["duplicate_id"]) != duplicate_id or int(existing["primary_id"]) != primary_id:
+                    raise DomainError("同一批次编号对应的合并对象不一致", 409)
+                if existing["status"] == "reverted":
+                    raise DomainError("该批次已撤销，不能重放，请重新发起确认", 409)
+                return {"batch_id": batch_id, "idempotent": True, "status": existing["status"],
+                        "summary": json.loads(existing["summary"])}
+            duplicate = conn.execute("SELECT * FROM incidents WHERE id=?", (duplicate_id,)).fetchone()
+            if not duplicate:
+                raise DomainError("重复报警不存在", 404)
+            if duplicate["status"] == "merged":
+                raise DomainError("重复报警已并入其他事件", 409)
+            if duplicate["status"] != "duplicate":
+                raise DomainError("该事件不是待确认的重复报警", 409)
+            if duplicate["duplicate_of"] != primary_id:
+                raise DomainError("主事件与重复报警的归属关系不一致", 409)
+            primary = conn.execute("SELECT * FROM incidents WHERE id=?", (primary_id,)).fetchone()
+            if not primary:
+                raise DomainError("主事件不存在", 404)
+            if primary["status"] not in ACTIVE_INCIDENT:
+                raise DomainError("主事件当前不可并入", 409)
+            area_rows = conn.execute(
+                "SELECT id,code FROM search_areas WHERE incident_id=? ORDER BY id", (duplicate_id,)
+            ).fetchall()
+            area_ids = [int(r["id"]) for r in area_rows]
+            clue_rows = conn.execute(
+                "SELECT id FROM clues WHERE incident_id=? ORDER BY id", (duplicate_id,)
+            ).fetchall()
+            clue_ids = [int(r["id"]) for r in clue_rows]
+            now = utcnow()
+            if area_ids:
+                conn.execute(
+                    "UPDATE search_areas SET incident_id=?,version=version+1,updated_at=? WHERE id IN (%s)"
+                    % ",".join("?" for _ in area_ids),
+                    [primary_id, now, *area_ids],
+                )
+            if clue_ids:
+                conn.execute(
+                    "UPDATE clues SET incident_id=? WHERE id IN (%s)"
+                    % ",".join("?" for _ in clue_ids),
+                    [primary_id, *clue_ids],
+                )
+            flipped = conn.execute(
+                "UPDATE incidents SET status='merged',version=version+1,updated_at=? WHERE id=? AND status='duplicate' AND version=?",
+                (now, duplicate_id, duplicate["version"]),
+            )
+            if flipped.rowcount != 1:
+                # 并发确认：另一名值班员已经先一步合并
+                raise DomainError("重复报警状态已变化，合并由另一方先完成", 409)
+            summary = {"areas": [{"id": r["id"], "code": r["code"]} for r in area_rows],
+                       "area_ids": area_ids, "clue_ids": clue_ids,
+                       "area_count": len(area_ids), "clue_count": len(clue_ids)}
+            conn.execute(
+                """INSERT INTO merge_batches(client_batch_id,duplicate_id,primary_id,actor,status,summary,confirmed_at)
+                   VALUES(?,?,?,?,?,?,?)""",
+                (batch_id, duplicate_id, primary_id, actor, "merged", json_dump(summary), now),
+            )
+            self._audit(conn, primary_id, actor, "duplicate.confirmed",
+                        {"duplicate_id": duplicate_id, "duplicate_code": duplicate["code"],
+                         "batch_id": batch_id, "areas": len(area_ids), "clues": len(clue_ids)})
+            self._audit(conn, duplicate_id, actor, "incident.merged_into",
+                        {"primary_id": primary_id, "primary_code": primary["code"], "batch_id": batch_id})
+            return {"batch_id": batch_id, "idempotent": False, "status": "merged", "summary": summary}
+
+    def revert_duplicate_merge(self, actor: str, role: str, client_batch_id: str,
+                               reason: str) -> dict[str, Any]:
+        """撤销合并：把仍属于主事件的原区域和线索放回重复报警。
+
+        只移动批次记录内、且此刻仍挂在主事件名下的区域/线索，避免拆坏其他
+        报警或撤销期间新增的内容；区域已另作处理时，相关线索解除区域关联
+        而不是错误地跨事件悬挂。主事件若已关闭，先转回 reported 待处理。
+        """
+        actor = clean_actor(actor)
+        require_role(role, {"coordinator"}, "撤销重复报警合并")
+        reason = reason.strip()
+        if not reason:
+            raise DomainError("撤销原因不能为空")
+        batch_id = client_batch_id.strip()
+        if not batch_id:
+            raise DomainError("缺少合并批次编号")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            batch = conn.execute("SELECT * FROM merge_batches WHERE client_batch_id=?", (batch_id,)).fetchone()
+            if not batch:
+                raise DomainError("合并批次不存在", 404)
+            if batch["status"] == "reverted":
+                raise DomainError("合并批次已经撤销", 409)
+            duplicate_id, primary_id = int(batch["duplicate_id"]), int(batch["primary_id"])
+            duplicate = conn.execute("SELECT * FROM incidents WHERE id=?", (duplicate_id,)).fetchone()
+            primary = conn.execute("SELECT * FROM incidents WHERE id=?", (primary_id,)).fetchone()
+            if not duplicate or not primary:
+                raise DomainError("合并批次关联的事件不存在", 404)
+            if duplicate["status"] != "merged" or duplicate["duplicate_of"] != primary_id:
+                raise DomainError("重复报警的合并状态已变化，不能撤销", 409)
+            now = utcnow()
+            primary_reopened = False
+            if primary["status"] in CLOSED_INCIDENT:
+                reopened = conn.execute(
+                    "UPDATE incidents SET status='reported',version=version+1,updated_at=? WHERE id=? AND version=?",
+                    (now, primary_id, primary["version"]),
+                )
+                if reopened.rowcount != 1:
+                    raise DomainError("主事件状态已变化，请刷新后重试", 409)
+                primary_reopened = True
+            summary = json.loads(batch["summary"])
+            area_ids = [int(x) for x in summary.get("area_ids", [])]
+            clue_ids = [int(x) for x in summary.get("clue_ids", [])]
+            restored_areas: list[int] = []
+            restored_clues: list[int] = []
+            detached_clues = 0
+            if area_ids:
+                placeholders = ",".join("?" for _ in area_ids)
+                kept = conn.execute(
+                    "SELECT id FROM search_areas WHERE id IN (%s) AND incident_id=?" % placeholders,
+                    [*area_ids, primary_id],
+                ).fetchall()
+                restored_areas = [int(r["id"]) for r in kept]
+                if restored_areas:
+                    conn.execute(
+                        "UPDATE search_areas SET incident_id=?,version=version+1,updated_at=? WHERE id IN (%s)"
+                        % ",".join("?" for _ in restored_areas),
+                        [duplicate_id, now, *restored_areas],
+                    )
+            if clue_ids:
+                placeholders = ",".join("?" for _ in clue_ids)
+                kept = conn.execute(
+                    "SELECT id,area_id FROM clues WHERE id IN (%s) AND incident_id=?" % placeholders,
+                    [*clue_ids, primary_id],
+                ).fetchall()
+                restored_clues = [int(r["id"]) for r in kept]
+                if restored_clues:
+                    conn.execute(
+                        "UPDATE clues SET incident_id=? WHERE id IN (%s)"
+                        % ",".join("?" for _ in restored_clues),
+                        [duplicate_id, *restored_clues],
+                    )
+                restored_set = set(restored_clues)
+                orphan_areas = [r["area_id"] for r in kept
+                                if r["area_id"] is not None and r["area_id"] not in restored_areas]
+                # 区域未随本批次放回（仍属主事件）时，线索不能跨事件引用它
+                if orphan_areas:
+                    detached = conn.execute(
+                        "UPDATE clues SET area_id=NULL WHERE id IN (%s) AND area_id IN (%s)"
+                        % (",".join("?" for _ in restored_clues), ",".join("?" for _ in orphan_areas)),
+                        [*restored_clues, *orphan_areas],
+                    )
+                    detached_clues = detached.rowcount
+            unflipped = conn.execute(
+                "UPDATE incidents SET status='duplicate',version=version+1,updated_at=? WHERE id=? AND status='merged' AND version=?",
+                (now, duplicate_id, duplicate["version"]),
+            )
+            if unflipped.rowcount != 1:
+                raise DomainError("重复报警状态已变化，请刷新后重试", 409)
+            conn.execute(
+                "UPDATE merge_batches SET status='reverted',revert_reason=?,reverted_at=? WHERE id=?",
+                (reason, now, batch["id"]),
+            )
+            revert_summary = {"restored_area_ids": restored_areas, "restored_clue_ids": restored_clues,
+                              "restored_area_count": len(restored_areas),
+                              "restored_clue_count": len(restored_clues),
+                              "detached_clue_count": detached_clues,
+                              "primary_reopened": primary_reopened}
+            self._audit(conn, primary_id, actor, "duplicate.reverted",
+                        {"duplicate_id": duplicate_id, "duplicate_code": duplicate["code"],
+                         "batch_id": batch_id, "reason": reason, **revert_summary})
+            self._audit(conn, duplicate_id, actor, "incident.merge_reverted",
+                        {"primary_id": primary_id, "primary_code": primary["code"], "batch_id": batch_id})
+            return {"batch_id": batch_id, "status": "reverted", "summary": revert_summary}
+
     def merge_offline_batch(self, actor: str, role: str, client_batch_id: str,
                             events: list[dict[str, Any]]) -> dict[str, Any]:
         actor = clean_actor(actor)
@@ -510,7 +715,7 @@ class MaritimeSARService:
                         incident = conn.execute("SELECT * FROM incidents WHERE id=?", (incident_id,)).fetchone()
                         if not incident:
                             raise DomainError("事件不存在", 404)
-                        if incident["status"] in CLOSED_INCIDENT:
+                        if incident["status"] not in WORKABLE_INCIDENT:
                             raise DomainError("已结束事件不能新增线索", 409)
                         area_id = event.get("area_id")
                         if area_id is not None and not conn.execute(
@@ -554,8 +759,12 @@ class MaritimeSARService:
             areas = [dict(r) for r in conn.execute("SELECT * FROM search_areas ORDER BY priority,id").fetchall()]
             clues = [dict(r) for r in conn.execute("SELECT * FROM clues ORDER BY id DESC LIMIT 200").fetchall()]
             assets = [dict(r) for r in conn.execute("SELECT * FROM assets ORDER BY id").fetchall()]
+            merges = [dict(r) for r in conn.execute("SELECT * FROM merge_batches ORDER BY id DESC").fetchall()]
             timeline = [dict(r) for r in conn.execute("SELECT * FROM timeline ORDER BY id DESC LIMIT 300").fetchall()]
-        return {"incidents": incidents, "assets": assets, "search_areas": areas, "clues": clues, "timeline": timeline}
+        for batch in merges:
+            batch["summary"] = json.loads(batch["summary"] or "{}")
+        return {"incidents": incidents, "assets": assets, "search_areas": areas, "clues": clues,
+                "merge_batches": merges, "timeline": timeline}
 
     def incident_timeline(self, incident_id: int) -> list[dict[str, Any]]:
         with self.connect() as conn:
@@ -653,6 +862,10 @@ class ApiHandler(BaseHTTPRequestHandler):
                 result = self.service.transfer_incident(actor, role, **data)
             elif path == "/api/incidents/close":
                 result = self.service.close_incident(actor, role, **data)
+            elif path == "/api/incidents/merge-duplicate":
+                result = self.service.confirm_duplicate_merge(actor, role, **data)
+            elif path == "/api/incidents/revert-merge":
+                result = self.service.revert_duplicate_merge(actor, role, **data)
             elif path == "/api/offline/batch":
                 result = self.service.merge_offline_batch(actor, role, **data)
             else:

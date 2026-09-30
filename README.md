@@ -25,8 +25,30 @@ python3 app.py
 - `POST /api/clues`、`POST /api/clues/verify`
 - `POST /api/assets/withdraw`：撤回资源并释放任务
 - `POST /api/incidents/transfer`、`POST /api/incidents/close`
+- `POST /api/incidents/merge-duplicate`：按批次确认重复报警，区域和线索并入主事件
+- `POST /api/incidents/revert-merge`：按批次撤销合并，放回仍属于主事件的内容
 - `POST /api/offline/batch`：幂等合并离线记录
 - `GET /api/incidents/{id}/timeline`
+
+### 重复报警合并流程
+
+待确认的重复报警（`duplicate`）上可以继续创建搜索区域、记录线索和分配资源；
+确认合并后才冻结（`merged`），原事件记录与编号保留，便于追溯。
+
+- **确认合并** `POST /api/incidents/merge-duplicate`，参数
+  `client_batch_id`（调用方生成的批次幂等键）、`duplicate_id`、`primary_id`。
+  重复报警名下的全部搜索区域和线索整体改挂到主事件，资源分配随区域保留，
+  并写入 `merge_batches` 批次与时间线。
+- **并发**：状态翻转使用版本 CAS 并在 `BEGIN IMMEDIATE` 事务内执行，
+  两名值班员同时确认时只有一方成功，另一方收到 409。
+- **重试**：合并失败后用同一 `client_batch_id` 重放，返回首次结果
+  （`idempotent: true`），已经并入的区域和线索不会重复移动；批次对象
+  不一致或批次已撤销时返回 409。
+- **撤销** `POST /api/incidents/revert-merge`，参数 `client_batch_id`、
+  `reason`。只把批次记录内、此刻仍挂在主事件名下的区域和线索放回原报警；
+  已转走或主事件自己新增的内容不受影响。区域已离开主事件时，相关线索
+  放回并解除跨事件的区域引用。主事件若已关闭/取消，先转 `reported`
+  （待处理）再撤销。撤销后批次不可重放，需要重新发起确认。
 
 ## 测试
 
