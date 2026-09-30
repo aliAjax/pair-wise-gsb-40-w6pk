@@ -1,8 +1,22 @@
 <!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>海上搜救协调</title>
-<style>body{font:15px/1.6 system-ui,sans-serif;max-width:1100px;margin:30px auto;padding:0 20px;color:#17324d}table{border-collapse:collapse;width:100%;margin:16px 0}th,td{border:1px solid #cbd8e3;padding:8px;text-align:left}th{background:#edf5fb}code{background:#f2f5f7;padding:2px 5px}.card{background:#f7fbfe;border-left:5px solid #2784c7;padding:12px 16px}</style>
-<h1>海上搜救协调</h1><div class="card">页面读取实时状态。业务写入通过 README 中的 JSON API 完成，并需要 <code>X-User</code>、<code>X-Role</code>。</div>
-<h2>遇险事件</h2><table id="incidents"><thead><tr><th>编号</th><th>船名</th><th>状态</th><th>海况</th><th>负责机构</th><th>版本</th></tr></thead><tbody></tbody></table>
+<style>body{font:15px/1.6 system-ui,sans-serif;max-width:1180px;margin:30px auto;padding:0 20px;color:#17324d}table{border-collapse:collapse;width:100%;margin:16px 0}th,td{border:1px solid #cbd8e3;padding:8px;text-align:left}th{background:#edf5fb}code{background:#f2f5f7;padding:2px 5px}.card{background:#f7fbfe;border-left:5px solid #2784c7;padding:12px 16px}.tag{font-size:12px;padding:1px 6px;border-radius:8px;background:#e2eef7}</style>
+<h1>海上搜救协调</h1><div class="card">页面读取实时状态。重复报警的确认并回 / 撤销通过 <code>POST /api/incidents/merge</code>、<code>POST /api/incidents/merge/revert</code> 完成，并需要 <code>X-User</code>、<code>X-Role</code>。</div>
+<h2>遇险事件</h2><table id="incidents"><thead><tr><th>编号</th><th>船名</th><th>状态</th><th>重复并入</th><th>合并批次</th><th>海况</th><th>负责机构</th><th>版本</th></tr></thead><tbody></tbody></table>
 <h2>资源</h2><table id="assets"><thead><tr><th>名称</th><th>类型</th><th>状态</th><th>航程</th></tr></thead><tbody></tbody></table>
-<h2>搜索区域</h2><table id="areas"><thead><tr><th>编号</th><th>事件</th><th>状态</th><th>优先级</th><th>资源</th></tr></thead><tbody></tbody></table>
+<h2>搜索区域</h2><table id="search_areas"><thead><tr><th>编号</th><th>所属事件</th><th>来源事件</th><th>状态</th><th>优先级</th><th>资源</th></tr></thead><tbody></tbody></table>
+<h2>线索</h2><table id="clues"><thead><tr><th>ID</th><th>所属事件</th><th>来源事件</th><th>来源</th><th>状态</th><th>置信度</th></tr></thead><tbody></tbody></table>
+<h2>重复报警合并批次</h2><table id="merge_batches"><thead><tr><th>批次</th><th>重复报警</th><th>主事件</th><th>状态</th><th>操作人</th><th>并入/失败</th><th>确认时间</th><th>撤销时间</th></tr></thead><tbody></tbody></table>
 <h2>时间线</h2><ol id="timeline"></ol>
-<script>async function load(){const d=await fetch('/api/state').then(r=>r.json());const fill=(id,rows,cols)=>{document.querySelector('#'+id+' tbody').innerHTML=rows.map(r=>'<tr>'+cols.map(c=>`<td>${r[c]??''}</td>`).join('')+'</tr>').join('')};fill('incidents',d.incidents,['code','vessel_name','status','sea_state','lead_org','version']);fill('assets',d.assets,['name','kind','status','range_km']);fill('areas',d.search_areas,['code','incident_id','status','priority','assigned_asset_id']);document.querySelector('#timeline').innerHTML=d.timeline.slice(0,20).map(x=>`<li>${x.created_at} ${x.action} ${x.details}</li>`).join('')}load()</script></html>
+<script>
+async function load(){
+  const d=await fetch('/api/state').then(r=>r.json());
+  const fill=(id,rows,cols)=>{document.querySelector('#'+id+' tbody').innerHTML=rows.map(r=>'<tr>'+cols.map(c=>`<td>${r[c]??''}</td>`).join('')+'</tr>').join('')};
+  fill('incidents',d.incidents,['code','vessel_name','status','duplicate_of','merge_batch_id','sea_state','lead_org','version']);
+  fill('assets',d.assets,['name','kind','status','range_km']);
+  fill('search_areas',d.search_areas,['code','incident_id','origin_incident_id','status','priority','assigned_asset_id']);
+  fill('clues',d.clues,['id','incident_id','origin_incident_id','source','status','confidence']);
+  document.querySelector('#merge_batches tbody').innerHTML=(d.merge_batches||[]).map(b=>`<tr><td><code>${b.client_batch_id}</code></td><td>${b.duplicate_incident_id}</td><td>${b.main_incident_id}</td><td><span class="tag">${b.status}</span></td><td>${b.actor}</td><td>${b.summary.merged??''} / ${(b.summary.failed||[]).length}</td><td>${b.confirmed_at??''}</td><td>${b.reverted_at??''}</td></tr>`).join('');
+  document.querySelector('#timeline').innerHTML=d.timeline.slice(0,20).map(x=>`<li>${x.created_at} ${x.action} ${x.details}</li>`).join('')
+}
+load();setInterval(load,15000);
+</script></html>
